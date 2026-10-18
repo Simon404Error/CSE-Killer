@@ -3,7 +3,11 @@
 布局按使用流程分为横向三段：
     ① 文件卡（横跨整行）：选择 PDF，显示文件名与页数统计
     ② 设置卡 ×2（并排）：打印机出纸方式 / 翻面方式，选项与动图演示组合
-    ③ 预览与步骤卡：正反面页序预览 + 三步打印说明，生成按钮在卡头右上
+    ③ 预览与步骤卡：按纸张的拼合预览 + 三步打印说明，生成按钮在卡头右上
+
+拼合预览问的是"打印出来合在一起对不对"，所以按**纸张**而不是按文件组织：
+逐张列出「第 a 页 ↔ 第 b 页」，配对是否连续一眼可见。想看真实页面的
+缩略图就点卡头的「预览拼合效果」。
 """
 
 from pathlib import Path
@@ -14,6 +18,7 @@ from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -23,9 +28,21 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from tools.duplex_print.core.reorderer import DuplexReorderer
+from tools.duplex_print.core.reorderer import (
+    FLIP_LONG_EDGE,
+    FLIP_NONE,
+    FLIP_SHORT_EDGE,
+    DuplexReorderer,
+    back_needs_rotation,
+    page_orders,
+    simulate_sheets,
+)
 from tools.duplex_print.ui.animations import PaperExitDemo, PaperFlipDemo
+from tools.duplex_print.ui.preview_dialog import DuplexPreviewDialog
 from ui.dialogs import show_success
+
+#: 主界面配对表最多列出的纸张数，再多就只给汇总（完整视图在弹窗里）
+SHEET_ROWS_INLINE = 10
 
 # ============================================================
 #  Design tokens (Slate + Indigo)
@@ -59,6 +76,37 @@ RADIO_STYLE = (
     "QRadioButton { font-size: 13px; color: #374151; background: transparent;"
     " border: none; padding: 3px 0; }"
     "QRadioButton::indicator { width: 14px; height: 14px; }"
+)
+
+# 次要按钮：拼合预览这类"看效果"的动作，不抢生成按钮的视觉焦点
+SECONDARY_BTN = (
+    "QPushButton {"
+    "  background-color: #FFFFFF;"
+    "  color: #4F46E5;"
+    "  border: 1px solid #C7D2FE;"
+    "  border-radius: 8px;"
+    "  padding: 8px 16px;"
+    "  font-size: 13px;"
+    "  font-weight: 600;"
+    "  min-height: 34px;"
+    "}"
+    "QPushButton:hover { background-color: #EEF2FF; }"
+    "QPushButton:pressed { background-color: #E0E7FF; }"
+    "QPushButton:disabled { color: #A5B4FC; border-color: #E5E7EB; }"
+)
+
+# 配对表单元格：纸号 / 页码 / 连接符
+SHEET_INDEX_STYLE = (
+    "font-size: 12px; color: #9CA3AF; background: transparent; border: none;"
+)
+SHEET_PAGE_STYLE = (
+    "font-size: 12px; color: #4F46E5; background: transparent; border: none;"
+)
+SHEET_BLANK_STYLE = (
+    "font-size: 12px; color: #D1D5DB; background: transparent; border: none;"
+)
+SHEET_ARROW_STYLE = (
+    "font-size: 12px; color: #C7D2FE; background: transparent; border: none;"
 )
 
 HINT_STYLE = (
@@ -214,7 +262,7 @@ class DuplexPrintWidget(QWidget):
         # 卡头：标题 + 当前选中值徽章
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-        title = QLabel("🖨️ 打印机出纸方式" if kind == "out" else "🔄 反面文字方向")
+        title = QLabel("🖨️ 打印机出纸方式" if kind == "out" else "🔄 翻面方式")
         title.setStyleSheet(CARD_TITLE_STYLE)
         title_row.addWidget(title)
         title_row.addStretch()
@@ -240,23 +288,34 @@ class DuplexPrintWidget(QWidget):
             self.exit_demo = demo
             self.badge_out = badge
         else:
-            self.radio_same = QRadioButton("反面文字与正面同向（推荐）· 自动旋转反面页")
-            self.radio_same.setStyleSheet(RADIO_STYLE)
-            self.radio_same.setChecked(True)
-            self.radio_opposite = QRadioButton("反面文字与正面相反 · 反面页不旋转")
-            self.radio_opposite.setStyleSheet(RADIO_STYLE)
-            options_layout.addWidget(self.radio_same)
-            options_layout.addWidget(self.radio_opposite)
+            self.radio_flip_none = QRadioButton("不翻面 · 整叠原样放回进纸盒")
+            self.radio_flip_none.setStyleSheet(RADIO_STYLE)
+            self.radio_flip_long = QRadioButton("左右反转 · 像翻书页，以长边为轴（反面页预转 180°）")
+            self.radio_flip_long.setStyleSheet(RADIO_STYLE)
+            self.radio_flip_long.setChecked(True)
+            self.radio_flip_short = QRadioButton("上下翻转 · 纸头调转，以短边为轴（反面页不旋转）")
+            self.radio_flip_short.setStyleSheet(RADIO_STYLE)
+            options_layout.addWidget(self.radio_flip_none)
+            options_layout.addWidget(self.radio_flip_long)
+            options_layout.addWidget(self.radio_flip_short)
             demo = PaperFlipDemo()
             self.flip_demo = demo
             self.badge_flip = badge
         layout.addWidget(options)
 
-        # 翻面方向依赖打印机与翻面习惯，提示试打校准
+        # 反面要不要预转因机型而异（出纸与进纸的前沿朝向是否一致），
+        # 没法从代码推出来，只能以试打为准
         if kind == "flip":
-            hint = QLabel("按动画演示翻面即可；若试打发现方向仍不对，切换上面的选项后重新生成")
+            hint = QLabel("这一步因打印机而异：拿不准就先试打 2 页，若反面文字颠倒了，换另一个选项重新生成")
             hint.setStyleSheet(
                 "font-size: 11px; color: #B45309; background: transparent; border: none;"
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+        else:
+            hint = QLabel("出纸方式只用来预选推荐的翻面方式，可随时手动改")
+            hint.setStyleSheet(
+                "font-size: 11px; color: #9CA3AF; background: transparent; border: none;"
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -266,7 +325,7 @@ class DuplexPrintWidget(QWidget):
         return card
 
     def _build_preview_card(self) -> QWidget:
-        """③ 预览与步骤卡：页码预览 + 三步打印说明 + 生成按钮。"""
+        """③ 拼合预览与步骤卡：按纸张的配对表 + 三步打印说明 + 两个按钮。"""
         card = QWidget()
         card.setObjectName("card")
         card.setStyleSheet(CARD_STYLE)
@@ -274,13 +333,18 @@ class DuplexPrintWidget(QWidget):
         layout.setContentsMargins(16, 12, 16, 14)
         layout.setSpacing(10)
 
-        # 卡头：标题 + 生成按钮（下一步行动在视觉焦点位置）
+        # 卡头：标题 + 看效果/生成按钮（下一步行动在视觉焦点位置）
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-        title = QLabel("📋 页序预览与打印步骤")
+        title = QLabel("📋 拼合预览与打印步骤")
         title.setStyleSheet(CARD_TITLE_STYLE)
         title_row.addWidget(title)
         title_row.addStretch()
+        self.btn_preview = QPushButton("👁 预览拼合效果")
+        self.btn_preview.setStyleSheet(SECONDARY_BTN)
+        self.btn_preview.setToolTip("按纸张逐张查看正反两面的缩略图，确认合起来页码连续")
+        self.btn_preview.setEnabled(False)
+        title_row.addWidget(self.btn_preview)
         self.btn_generate = QPushButton("🖨️ 生成两份打印文件")
         self.btn_generate.setStyleSheet(PRIMARY_BTN)
         self.btn_generate.setEnabled(False)
@@ -289,12 +353,11 @@ class DuplexPrintWidget(QWidget):
 
         content = QHBoxLayout()
         content.setSpacing(16)
-        content.addLayout(self._build_preview_column("front"), stretch=2)
-        content.addLayout(self._build_preview_column("back"), stretch=2)
+        content.addLayout(self._build_sheet_column(), stretch=2)
         content.addLayout(self._build_steps_column(), stretch=3)
         layout.addLayout(content, stretch=1)
 
-        # 奇数页提示（默认隐藏）
+        # 奇数页 / 占位页提示（默认隐藏）
         self.hint_odd = QLabel()
         self.hint_odd.setStyleSheet(HINT_STYLE)
         self.hint_odd.setWordWrap(True)
@@ -302,30 +365,42 @@ class DuplexPrintWidget(QWidget):
         layout.addWidget(self.hint_odd)
         return card
 
-    def _build_preview_column(self, side: str) -> QVBoxLayout:
-        """构建页序预览列，side 为 'front' 或 'back'。"""
+    def _build_sheet_column(self) -> QVBoxLayout:
+        """构建拼合预览列：标题行 + 逐张纸的「正面页 ↔ 反面页」配对表。"""
         col = QVBoxLayout()
         col.setSpacing(4)
 
-        label = QLabel()
-        label.setStyleSheet(
-            "font-size: 12px; font-weight: 700; color: #6B7280; background: transparent; border: none;"
-        )
-        col.addWidget(label)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        self.label_front_title = QLabel("正面")
+        self.label_back_title = QLabel("反面")
+        for label in (self.label_front_title, self.label_back_title):
+            label.setStyleSheet(
+                "font-size: 12px; font-weight: 700; color: #6B7280;"
+                " background: transparent; border: none;"
+            )
+        title_row.addWidget(self.label_front_title)
+        title_row.addStretch()
+        title_row.addWidget(self.label_back_title)
+        col.addLayout(title_row)
 
-        pages = QLabel()
-        pages.setStyleSheet("background: transparent; border: none;")
-        pages.setWordWrap(True)
-        pages.setTextFormat(Qt.TextFormat.RichText)
-        pages.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        col.addWidget(pages, stretch=1)
+        # 配对表：行 = 一张纸，列 = 纸号 / 正面页 / ↔ / 反面页。
+        # 用 QGridLayout 而不是富文本表格——行高和列宽都可控，不会撑破卡片。
+        table = QWidget()
+        table.setStyleSheet("background: transparent; border: none;")
+        self._sheet_grid = QGridLayout(table)
+        self._sheet_grid.setContentsMargins(0, 0, 0, 0)
+        self._sheet_grid.setHorizontalSpacing(6)
+        self._sheet_grid.setVerticalSpacing(3)
+        self._sheet_grid.setColumnStretch(1, 1)
+        self._sheet_grid.setColumnStretch(3, 1)
+        col.addWidget(table)
 
-        if side == "front":
-            self.label_front_title = label
-            self.label_front = pages
-        else:
-            self.label_back_title = label
-            self.label_back = pages
+        self.label_sheet_summary = QLabel()
+        self.label_sheet_summary.setStyleSheet(SUBTLE_STYLE)
+        self.label_sheet_summary.setWordWrap(True)
+        col.addWidget(self.label_sheet_summary)
+        col.addStretch()
         return col
 
     def _build_steps_column(self) -> QVBoxLayout:
@@ -352,12 +427,15 @@ class DuplexPrintWidget(QWidget):
     def _connect_signals(self):
         self.btn_back.clicked.connect(self.back_requested.emit)
         self.btn_choose.clicked.connect(self._on_choose_file)
+        self.btn_preview.clicked.connect(self._on_preview)
         self.btn_generate.clicked.connect(self._on_generate)
+        # 出纸方式只管预选推荐值；翻面方式才决定页序与旋转
+        self.radio_face_down.toggled.connect(self._on_face_option_toggled)
+        self.radio_face_up.toggled.connect(self._on_face_option_toggled)
         for radio in (
-            self.radio_face_down,
-            self.radio_face_up,
-            self.radio_same,
-            self.radio_opposite,
+            self.radio_flip_none,
+            self.radio_flip_long,
+            self.radio_flip_short,
         ):
             radio.toggled.connect(self._on_options_changed)
 
@@ -384,6 +462,7 @@ class DuplexPrintWidget(QWidget):
         self._page_count = count
         self.label_file.setText(Path(path).name)
         self.label_file.setToolTip(path)
+        self.btn_preview.setEnabled(True)
         self.btn_generate.setEnabled(True)
         self._file_card.setStyleSheet(CARD_STYLE)
         self._refresh_preview()
@@ -452,60 +531,152 @@ class DuplexPrintWidget(QWidget):
             for url in mime_data.urls()
         )
 
-    def _on_options_changed(self):
+    def _on_face_option_toggled(self, checked: bool):
+        """出纸方式变化时预选一个推荐的翻面方式（用户可再手动改）。
+
+        只有"变成选中"的那一次才需要处理，否则一次切换会触发两次。
+        预选值若与当前相同，setChecked 不发信号，所以动图在这里显式刷新。
+        """
+        if not checked:
+            return
+        if self.radio_face_down.isChecked():
+            self.radio_flip_none.setChecked(True)
+        else:
+            self.radio_flip_long.setChecked(True)
         self.exit_demo.set_face_down(self.radio_face_down.isChecked())
-        self.flip_demo.set_rotate(self.radio_same.isChecked())
         self._refresh_preview()
         self._refresh_steps()
 
-    def _front_back_orders(self) -> tuple[list[int], list[int]]:
-        """返回 (正面页码, 反面页码)，均为 1-indexed 列表。"""
-        front = list(range(1, self._page_count + 1, 2))
-        back = list(range(2, self._page_count + 1, 2))
-        if self.radio_face_down.isChecked():
-            back.reverse()
-        return front, back
+    def _on_options_changed(self):
+        self.exit_demo.set_face_down(self.radio_face_down.isChecked())
+        self.flip_demo.set_flip(self._current_flip())
+        self._refresh_preview()
+        self._refresh_steps()
+
+    def _current_flip(self) -> str:
+        """当前选中的翻面方式。"""
+        if self.radio_flip_none.isChecked():
+            return FLIP_NONE
+        if self.radio_flip_short.isChecked():
+            return FLIP_SHORT_EDGE
+        return FLIP_LONG_EDGE
+
+    def _front_back_orders(self) -> tuple[list[int], list[int | None]]:
+        """返回 (正面页码, 反面页码)，均为 1-based 列表。
+
+        反面列表里的 None 表示空白占位页（「不翻面」遇到奇数页文档时会出现）。
+        """
+        front, back = page_orders(self._page_count, self._current_flip())
+        return (
+            [p + 1 for p in front],
+            [None if p is None else p + 1 for p in back],
+        )
 
     def _refresh_preview(self):
         # 设置卡徽章：当前选中值
         self.badge_out.setText("面朝下" if self.radio_face_down.isChecked() else "面朝上")
-        self.badge_flip.setText("同向" if self.radio_same.isChecked() else "相反")
+        self.badge_flip.setText(
+            {FLIP_NONE: "不翻面", FLIP_LONG_EDGE: "左右翻", FLIP_SHORT_EDGE: "上下翻"}[
+                self._current_flip()
+            ]
+        )
 
         if self._page_count <= 0:
             self.label_pages.setText("点击「选择 PDF」，或将 PDF 文件直接拖入此窗口，松开即加载")
             self.label_front_title.setText("正面")
             self.label_back_title.setText("反面")
-            self.label_front.setText("<span style='color:#D1D5DB; font-size:12px;'>—</span>")
-            self.label_back.setText("<span style='color:#D1D5DB; font-size:12px;'>—</span>")
-            self.hint_odd.setVisible(False)
+            self._sync_sheet_table()
+            self._refresh_hint()
             return
 
         front, back = self._front_back_orders()
-        rotate_note = ""
-        if self.radio_same.isChecked() and back:
-            rotate_note = " · 每页旋转 180°"
+        rotate_note = " · 每页旋转 180°" if back_needs_rotation(self._current_flip()) else ""
         self.label_front_title.setText(f"正面 · {len(front)} 页")
         self.label_back_title.setText(f"反面 · {len(back)} 页{rotate_note}")
-        self.label_front.setText(
-            f"<span style='color:#4F46E5; font-size:12px;'>{', '.join(map(str, front))}</span>"
-        )
-        if back:
-            self.label_back.setText(
-                f"<span style='color:#4F46E5; font-size:12px;'>{', '.join(map(str, back))}</span>"
-            )
-        else:
-            self.label_back.setText("<span style='color:#D1D5DB; font-size:12px;'>（无）</span>")
         self.label_pages.setText(
             f"共 {self._page_count} 页 · 正面 {len(front)} 页 · 反面 {len(back)} 页"
         )
+        self._sync_sheet_table()
+        self._refresh_hint()
+
+    def _sync_sheet_table(self):
+        """重建逐张纸的「正面页 ↔ 反面页」配对表。"""
+        while self._sheet_grid.count():
+            item = self._sheet_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        if self._page_count <= 0:
+            self.label_sheet_summary.setText("")
+            return
+
+        sheets = simulate_sheets(self._page_count, self._current_flip())
+        for row, (face, back_face) in enumerate(sheets[:SHEET_ROWS_INLINE]):
+            index = QLabel(f"{row + 1}")
+            index.setStyleSheet(SHEET_INDEX_STYLE)
+            front_label = QLabel(f"第 {face} 页")
+            front_label.setStyleSheet(SHEET_PAGE_STYLE)
+            front_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            arrow = QLabel("↔")
+            arrow.setStyleSheet(SHEET_ARROW_STYLE)
+            if back_face is None:
+                back_label = QLabel("空白面")
+                back_label.setStyleSheet(SHEET_BLANK_STYLE)
+            else:
+                back_label = QLabel(f"第 {back_face} 页")
+                back_label.setStyleSheet(SHEET_PAGE_STYLE)
+            self._sheet_grid.addWidget(index, row, 0)
+            self._sheet_grid.addWidget(front_label, row, 1)
+            self._sheet_grid.addWidget(arrow, row, 2)
+            self._sheet_grid.addWidget(back_label, row, 3)
+
+        if len(sheets) > SHEET_ROWS_INLINE:
+            self.label_sheet_summary.setText(
+                f"共 {len(sheets)} 张纸，此处只列前 {SHEET_ROWS_INLINE} 张；"
+                f"点「预览拼合效果」看全部。"
+            )
+        else:
+            self.label_sheet_summary.setText(f"共 {len(sheets)} 张纸")
+
+    def _refresh_hint(self):
+        """底部提示条：只在这两种"看起来像出错、其实是正常"的情况出现。"""
+        if self._page_count <= 0:
+            self.hint_odd.setVisible(False)
+            return
 
         if self._page_count % 2 == 1:
-            self.hint_odd.setText(
-                f"⚠️ 源文档共 {self._page_count} 页（奇数），最后一张纸的反面为空白，属正常现象。"
-            )
+            if self._current_flip() == FLIP_NONE:
+                self.hint_odd.setText(
+                    f"⚠️ 源文档共 {self._page_count} 页（奇数），且选了「不翻面」："
+                    f"反面文件最前面会多一张空白占位页，属正常现象"
+                    f"（省掉它会让后面每一页都错一张纸）。"
+                )
+            else:
+                self.hint_odd.setText(
+                    f"⚠️ 源文档共 {self._page_count} 页（奇数），最后一张纸的反面为空白，"
+                    f"属正常现象；反面文件已省掉这张空白页。"
+                )
             self.hint_odd.setVisible(True)
         else:
             self.hint_odd.setVisible(False)
+
+    def _on_preview(self):
+        """打开缩略图拼合预览。"""
+        if not self._src_path or self._page_count <= 0:
+            QMessageBox.information(self, "提示", "请先选择 PDF 文件。")
+            return
+        dialog = DuplexPreviewDialog(
+            self, self._src_path, self._page_count, self._current_flip()
+        )
+        dialog.exec()
+
+    def _has_back_content(self) -> bool:
+        """反面文件里是否有真实内容——全是空白占位页时视为没有反面。"""
+        _, back = self._front_back_orders()
+        return any(p is not None for p in back)
 
     def _refresh_steps(self):
         if self._page_count <= 0:
@@ -515,12 +686,25 @@ class DuplexPrintWidget(QWidget):
             return
 
         front, back = self._front_back_orders()
-        if self.radio_same.isChecked():
-            flip_desc = "拿起整叠纸左右反转（像翻书页）后放回进纸盒（反面已自动旋转 180°）"
+        has_back = self._has_back_content()
+
+        if not has_back:
+            flip_desc = "（源文档只有 1 页，无需翻面）"
+        elif self._current_flip() == FLIP_NONE:
+            flip_desc = (
+                "<b>不要翻面</b>——把整叠纸原样放回进纸盒即可，"
+                "反面文件已按纸叠的先后顺序排好"
+            )
+        elif self._current_flip() == FLIP_LONG_EDGE:
+            flip_desc = (
+                "拿起整叠纸<b>左右反转</b>（像翻书页，以长边为轴）后放回进纸盒"
+                "（反面已预转 180°，翻过来正读）"
+            )
         else:
-            flip_desc = "把整叠纸上下翻转（纸头调转）后放回进纸盒（反面不旋转）"
-        if not back:
-            flip_desc = "（无需翻面）"
+            flip_desc = (
+                "把整叠纸<b>上下翻转</b>（纸头调转，以短边为轴）后放回进纸盒"
+                "（反面与正面同向，不用旋转）"
+            )
 
         steps = (
             f"<b style='color:#4F46E5;'>① 打印正面</b><br>"
@@ -530,11 +714,10 @@ class DuplexPrintWidget(QWidget):
             f"<b style='color:#4F46E5;'>③ 打印反面</b><br>"
             f"打开「…-反面.pdf」，打印全部 {len(back)} 页"
         )
-        if back:
+        if has_back:
             steps += (
                 "<br><br><span style='color:#9CA3AF;'>"
-                "小贴士：首次使用建议先试打 2 页核对，"
-                "若反面文字颠倒，切换「反面文字方向」后重新生成。"
+                "小贴士：先对照左侧「拼合预览」确认每张纸的正反面页码连续，再正式打印，最省纸。"
                 "</span>"
             )
         else:
@@ -551,6 +734,7 @@ class DuplexPrintWidget(QWidget):
             return
 
         front, back = self._front_back_orders()
+        has_back = self._has_back_content()
         default_name = Path(self._src_path).name
         base, _ = QFileDialog.getSaveFileName(
             self,
@@ -566,7 +750,8 @@ class DuplexPrintWidget(QWidget):
         back_path = f"{stem}-反面.pdf"
 
         # getSaveFileName 只确认基准名，派生名需自查覆盖
-        existing = [p for p in (front_path, back_path) if Path(p).exists()]
+        targets = (front_path, back_path) if has_back else (front_path,)
+        existing = [p for p in targets if Path(p).exists()]
         if existing and QMessageBox.question(
             self,
             "确认覆盖",
@@ -578,14 +763,15 @@ class DuplexPrintWidget(QWidget):
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            # 反面的页序与是否需要旋转 180° 都由翻面方式决定，
+            # 见 core/reorderer.py 的 FLIP_NONE / FLIP_LONG_EDGE / FLIP_SHORT_EDGE。
             front_bytes, back_bytes = DuplexReorderer().reorder(
                 self._src_path,
-                face_down=self.radio_face_down.isChecked(),
-                flip_short_edge=self.radio_same.isChecked(),
+                flip=self._current_flip(),
             )
             with open(front_path, "wb") as f:
                 f.write(front_bytes)
-            if back_bytes:
+            if has_back:
                 with open(back_path, "wb") as f:
                     f.write(back_bytes)
         except Exception as exc:
@@ -595,7 +781,7 @@ class DuplexPrintWidget(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
 
-        if back_bytes:
+        if has_back:
             self.status_message.emit(
                 f"手动双面打印 - 已生成：{front_path}、{back_path}")
             show_success(
