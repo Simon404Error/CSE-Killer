@@ -38,6 +38,18 @@ CHART_PLACEHOLDERS = frozenset({
     "见图", "见图表", "",
 })
 
+# 装饰图(水印图标/页面花纹/二维码页小图标)的面积上限, 单位 mm²。
+# 边长和面积要同时小于阈值才算装饰图: 只用边长会把资料分析里 19.6×19.2mm
+# 的饼图选项一并丢掉, 题面只剩 A. B. C. D. 四个空标签。
+MIN_DECOR_IMAGE_AREA_MM2 = 250.0
+
+# 图片选项题(图形推理)在"只差一点放不下"时允许的等比缩放下限。
+# 图形推理每题一张图, 图往往占半页, 剩余空间差十几毫米就整块换页, 页尾
+# 会留下大片空白; 缩一点塞进去能省下不少页。缩得比这个下限还狠就宁可
+# 换页 —— 图形看不清就失去意义了。只对"选项就是图"的题生效, 资料分析
+# 的图表/折线图仍按原尺寸渲染。
+MIN_IMAGE_FIT_SCALE = 0.8
+
 
 @dataclass
 class LayoutConfig:
@@ -263,12 +275,16 @@ class LayoutEngine:
         # 共享材料图先于题干输出: 源位置上排在本题题干之前的图(表格/图表
         # 材料)是"读题前要先看"的内容, 排在题干之后会让题干先问到一张还没
         # 出现的表。取图放在 section 处理之后, 避免抢走 section 的材料。
+        # 图形推理这类非资料分析的题, 图是题面主体(六个图形分两类、展开图
+        # 折纸盒…), 差一点放不下时缩一点塞进当前页, 免得整块换页后页尾留白;
+        # 资料分析的图表/折线图仍按原尺寸渲染。
+        fit_images = not is_da
         if has_plain_images:
             leading, stem_images = self._split_leading_images(
                 question, self._take_images_for_question(question)
             )
             for img in leading:
-                self._add_image(img)
+                self._add_image(img, fit_to_remaining=fit_images)
 
         q_label = f"{question.number}{self.config.question_suffix}"
         stem_segments = self._stem_segments(question.stem, section_heading=getattr(question, "section_heading", ""))
@@ -304,11 +320,20 @@ class LayoutEngine:
         _chart_paired_images: list[ImageBlock] = []
         _CHART_OPTION_IMG_SCALE = 0.8
         if has_image_opts:
+            if is_last:
+                # 最后一题没有"下一题"来界定取图范围: 题干排在页尾时, 它的
+                # 选项图(图形推理中题干图与四个选项图常合成一张)整组排在紧
+                # 随的下一页上。不向后溢出一页的话一张都取不到, 题面只剩题干。
+                option_end_page = self._trailing_image_page(question)
+                option_end_y = None
+            else:
+                option_end_page = getattr(question, "source_end_page", None) or question.source_page
+                option_end_y = getattr(question, "source_end_y_mm", None)
             _option_images = self._take_images_in_source_range(
                 start_page=question.source_page,
                 start_y=getattr(question, "source_y_mm", 0) or 0,
-                end_page=getattr(question, "source_end_page", None) or question.source_page,
-                end_y=getattr(question, "source_end_y_mm", None),
+                end_page=option_end_page,
+                end_y=option_end_y,
             )
             # Filter out non-content images (tiny, backgrounds, separators)
             # so the stem/option image count is accurate for interleaving.
@@ -316,7 +341,8 @@ class LayoutEngine:
             page_h = self.config.page_height_mm
             _option_images = [
                 img for img in _option_images
-                if not (img.width_mm < 20 and img.height_mm < 20)
+                if not (img.width_mm < 20 and img.height_mm < 20
+                        and img.width_mm * img.height_mm < MIN_DECOR_IMAGE_AREA_MM2)
                 and not (img.width_mm > page_w * 0.95 and img.height_mm > page_h * 0.95)
                 and not (img.height_mm < 15 and img.width_mm > img.height_mm * 5)
             ]
@@ -330,7 +356,14 @@ class LayoutEngine:
             # embedded chart labels (pie chart legends, axis annotations)
             # to remain legible.
             end_page = getattr(question, "source_end_page", None) or question.source_page
-            end_y = getattr(question, "source_end_y_mm", None)
+            if getattr(question, "source_end_page", None) is None:
+                # 最后一题没有"下一题"来界定取图范围: 题干排在页尾时, A/B/C/D
+                # 四个选项的饼图/柱图常被整组排到紧随的下一页上。不向后溢出一页
+                # 的话一张都取不到, 题面只剩 A. B. C. D. 四个空标签。
+                end_page = self._trailing_image_page(question)
+                end_y = None
+            else:
+                end_y = getattr(question, "source_end_y_mm", None)
             chart_images = self._take_images_in_source_range(
                 start_page=question.source_page,
                 start_y=getattr(question, "source_y_mm", 0) or 0,
@@ -349,28 +382,7 @@ class LayoutEngine:
             # Last DA question: extend range to capture trailing option images,
             # but exclude the final watermark page (QR code / ad pages at the
             # very end of the PDF that have no exam questions).
-            end_page = question.source_page
-            if self._images_by_page:
-                last_q_page = max(self._page_questions.keys()) if self._page_questions else question.source_page
-                # Allow one overflow page if the last question has chart-based
-                # options (e.g. "如图所示") OR if the stem mentions a chart /
-                # diagram keyword (柱状图, 折线图, 饼图, 图表, 如图, 见下图…).
-                # Text-based option charts (e.g. Q130's bar chart) are on
-                # the page after the stem, not captured by the option-text check.
-                _has_chart_opts = any(
-                    (o.text or "").strip() in CHART_PLACEHOLDERS
-                    for o in question.options
-                ) if question.options else False
-                _stem_mentions_chart = bool(
-                    question.stem and re.search(
-                        r'(柱状图|折线图|饼图|图表|如图|下图|上图|见图)',
-                        question.stem,
-                    )
-                )
-                overflow = 1 if (_has_chart_opts or _stem_mentions_chart) else 0
-                max_page = min(max(self._images_by_page.keys()), last_q_page + overflow)
-                if max_page > end_page:
-                    end_page = max_page
+            end_page = self._trailing_image_page(question)
             for img in self._take_images_in_source_range(
                 start_page=question.source_page,
                 start_y=getattr(question, "source_y_mm", 0) or 0,
@@ -381,7 +393,7 @@ class LayoutEngine:
         else:
             # 题干之后取到的图: 题干提到的图("以下折线图反映了…")等
             for img in stem_images:
-                self._add_image(img)
+                self._add_image(img, fit_to_remaining=fit_images)
 
         self._ensure_space(1)
         self._current_y += 1
@@ -397,7 +409,7 @@ class LayoutEngine:
             if len(_option_images) >= len(question.options):
                 stem_count = len(_option_images) - len(question.options)
                 for img in _option_images[:stem_count]:
-                    self._add_image(img)
+                    self._add_image(img, fit_to_remaining=True)
                 for i, opt in enumerate(question.options):
                     body = self._normalize_option_text(opt.text).strip()
                     display = body if body else opt.label
@@ -405,10 +417,12 @@ class LayoutEngine:
                         self._add_text_line("option_text", line, opt_indent, self.config.option_font, self.config.option_size, opt_line_h)
                     img_idx = stem_count + i
                     if img_idx < len(_option_images):
-                        self._add_image(_option_images[img_idx])
+                        self._add_image(_option_images[img_idx], fit_to_remaining=True)
             else:
+                # 只有一张合并图(图形推理常见: 题干图与四个选项图合成一张):
+                # 放不下就整块换页, 页尾会留大片空白, 所以允许适度缩小。
                 for img in _option_images:
-                    self._add_image(img)
+                    self._add_image(img, fit_to_remaining=True)
         elif _chart_paired_images:
             # 图表选项题且每张图对应一个选项: 标签与图交替输出, 让 A/B/C/D
             # 各自贴着自己的图。选项无文字时标签仍保留——它正是用来区分
@@ -1002,6 +1016,39 @@ class LayoutEngine:
                 return False
         return True
 
+    def _trailing_image_page(self, question: Question) -> int:
+        """最后一题的取图末页: 允许向后溢出一页, 但不吞掉文末的水印/二维码页。
+
+        最后一题的文字结束在页尾时, 它的图表选项(柱状图/饼图)或题干提到的图
+        往往被排到下一页; 而源 PDF 末尾又是"扫码对答案"的广告页, 那里的小图标
+        不是题目内容。溢出一页正好取到选项图, 又不至于把广告页一起吞进来。
+        """
+        end_page = question.source_page
+        if not self._images_by_page:
+            return end_page
+        last_q_page = max(self._page_questions.keys()) if self._page_questions else question.source_page
+        # Allow one overflow page if the last question has chart-based
+        # options (e.g. "如图所示") OR if the stem mentions a chart /
+        # diagram keyword (柱状图, 折线图, 饼图, 图表, 如图, 见下图…).
+        # Text-based option charts (e.g. Q130's bar chart) are on
+        # the page after the stem, not captured by the option-text check.
+        _has_chart_opts = any(
+            (o.text or "").strip() in CHART_PLACEHOLDERS
+            for o in question.options
+        ) if question.options else False
+        _stem_mentions_chart = bool(
+            question.stem and re.search(
+                r'(柱状图|折线图|饼图|图表|如图|下图|上图|见图)',
+                question.stem,
+            )
+        )
+        # 图片选项题(图形推理)同理: 选项本身就是图, 题干排在页尾时整组图
+        # 会落到下一页, 题干里也未必出现"如图"之类的字样(如"外表面展开图").
+        _has_image_opts = self._has_image_options(question)
+        overflow = 1 if (_has_chart_opts or _stem_mentions_chart or _has_image_opts) else 0
+        max_page = min(max(self._images_by_page.keys()), last_q_page + overflow)
+        return max(end_page, max_page)
+
     def _take_images_for_question(self, question: Question) -> list[ImageBlock]:
         """取"本题"源区间内的图片(取出即从页图池移除, 不会重复取)。
 
@@ -1042,8 +1089,12 @@ class LayoutEngine:
         # 是那个题的共享材料(资料分析的材料表常排成一整页图片), 不属于本题。
         # 不加限制的话, 上一题会把下一题的材料图提前取走, 等排到下一题时
         # 已无图可用, 材料就会消失。
+        # 例外: 本题文字一直延续到末页时(如"把下面六个图形分为两类"这类题,
+        # 题干在上一页页尾, 六个图形与选项文字都排在末页), 末页页首的图正是
+        # 本题的题图。此时若套用该保护会两头落空 —— 本题被挡在门外, 末页首题
+        # 的取图起点又在那张图之后, 于是图谁也取不到, 直接从题面消失。
         end_page_floor: float | None = None
-        if end_page != question.source_page:
+        if end_page != question.source_page and last_page != end_page:
             page_first = (self._page_questions.get(end_page) or [None])[0]
             if page_first is not None and page_first is not question:
                 end_page_floor = getattr(page_first, "source_y_mm", 0) or 0
@@ -1134,9 +1185,10 @@ class LayoutEngine:
         )
         return max(10, img.width_mm * scale), max(8, img.height_mm * scale)
 
-    def _add_image(self, img: ImageBlock, max_scale: float = 1.0):
+    def _add_image(self, img: ImageBlock, max_scale: float = 1.0, fit_to_remaining: bool = False):
         # Skip tiny decorative images (watermark icons, page ornaments, etc.)
-        if img.width_mm < 20 and img.height_mm < 20:
+        if (img.width_mm < 20 and img.height_mm < 20
+                and img.width_mm * img.height_mm < MIN_DECOR_IMAGE_AREA_MM2):
             return
         # Skip full-page background images (the rendered page image from the
         # original PDF, typically 210×297mm at position (0,0)). These are not
@@ -1164,6 +1216,15 @@ class LayoutEngine:
         )
         w = max(10, img.width_mm * scale)
         h = max(8, img.height_mm * scale)
+        if fit_to_remaining and h + 4 > self.content_bottom - self._current_y:
+            # 只差一点放不下时按剩余空间等比缩小, 免得为一张图整块换页、
+            # 在页尾留下近半页的空白。留 5mm 余量, 缩完正好不触发换页。
+            room = self.content_bottom - self._current_y - 5
+            fit = room / h if h > 0 else 1.0
+            if fit >= MIN_IMAGE_FIT_SCALE:
+                scale *= fit
+                w = max(10, img.width_mm * scale)
+                h = max(8, img.height_mm * scale)
         self._ensure_space(h + 4)
         x = self.config.margin_left + max(0, (self.content_width - w) / 2)
         self._current_page.elements.append(PageElement(
