@@ -8,8 +8,8 @@
 
 | 项目 | 内容                         |
 |------|----------------------------|
-| **版本号** | v1.2.1                     |
-| **发布日期** | 2026-09-27                 |
+| **版本号** | v1.2.2                     |
+| **发布日期** | 2026-10-18                 |
 | **运行平台** | Windows 10 / 11（64 位）      |
 | **Python 版本** | 3.10+   < 3.13 (OCR场景依赖限制) |
 | **开源协议** | MIT License                |
@@ -38,7 +38,7 @@
 
 `注：由于粉笔是使用Skia/Chromium PDF引擎生成，在文字提取上，可能会出发性能问题，导致提取较慢`
 
-- **双引擎解析**：自动识别 PDF 类型，文字型走 PyMuPDF 文本解析，扫描型走 PaddleOCR + PaddlePaddle 图文识别，CUDA 可用时自动启用 GPU（`注：目前只支持英伟达显卡`）
+- **文字型解析**：使用 PyMuPDF 提取文字型 PDF；检测到扫描件（图片型 PDF）时提示不支持转换（扫描件保真渲染与原文件一致，没有转换意义）
 - **智能清洗**：
     - 行测卷：自动去除水印、广告、二维码；识别题号与选项（A/B/C/D）；按五大模块归类（政治理论/常识判断、言语理解与表达、数量关系、判断推理、资料分析）；过滤页码等干扰信息
     - 申论卷：提取给定材料段落；分离作答要求；识别双栏排版；跳过答题卡页面
@@ -130,15 +130,15 @@
 
 ## 立即下载 Windows 安装包
 
-> 国内用户优先使用夸克网盘 / 百度网盘下载，打开链接后直接下载 `CivilServansTools-v1.2.1-x64.exe`，速度通常比 GitHub Release 更稳、更接近满速。
+> 国内用户优先使用夸克网盘 / 百度网盘下载，打开链接后直接下载 `CivilServansTools-v1.2.2-x64.exe`，速度通常比 GitHub Release 更稳、更接近满速。
 
 | 下载入口 | 推荐人群 | 链接                                                                                   |
 | --- | --- |--------------------------------------------------------------------------------------|
-| 夸克网盘 | 国内用户优先 | [夸克网盘下载](https://pan.quark.cn/s/7c7150419ec9) |
-| 百度网盘 | 国内用户优先 | [百度网盘下载（提取码 tjpr）](https://pan.baidu.com/s/1C7ibqxXT-8DwUsYxj8e-Hg?pwd=tjpr) |
-| GitHub Release 备用 | 能稳定访问 GitHub 的用户 | [v1.2.1 Release](https://github.com/codepmy/civil-servans-tools/releases/tag/v1.2.1) |
+| 夸克网盘 | 国内用户优先 | [夸克网盘下载](https://pan.quark.cn/s/7c7150419ec9)                                        |
+| 百度网盘 | 国内用户优先 | [百度网盘下载（提取码 tjpr）](https://pan.baidu.com/s/1C7ibqxXT-8DwUsYxj8e-Hg?pwd=tjpr)         |
+| GitHub Release 备用 | 能稳定访问 GitHub 的用户 | [v1.2.2 Release](https://github.com/codepmy/civil-servans-tools/releases/tag/v1.2.2) |
 
-安装时只需要下载并运行 `CivilServansTools-v1.2.1-x64.exe`。
+安装时只需要下载并运行 `CivilServansTools-v1.2.2-x64.exe`。
 
 ## 🛠️ 技术栈
 
