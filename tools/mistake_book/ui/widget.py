@@ -30,6 +30,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -436,7 +437,14 @@ def _ensure_arrow_png() -> str:
     成横杠、QProxyStyle 也被 QStyleSheetStyle 绕过，只能生成小 PNG
     供 QSS image 引用。存系统 temp 目录、构建时确保存在，
     不污染程序目录与 git。
+
+    必须在 QApplication 创建后调用：QPixmap 依赖 QGuiApplication，
+    导入期构造会触发 Qt qFatal，进程直接 abort。
     """
+    if QApplication.instance() is None:
+        raise RuntimeError(
+            "_ensure_arrow_png() 必须在 QApplication 创建后调用"
+        )
     path = Path(tempfile.gettempdir()) / "cstools_arrow_down.png"
     if not path.exists():
         pix = QPixmap(12, 12)
@@ -456,8 +464,19 @@ def _ensure_arrow_png() -> str:
     return str(path).replace("\\", "/")
 
 
-# 把箭头 PNG 路径注入 QSS（模块加载时执行一次）
-FMT_COMBO_STYLE = FMT_COMBO_STYLE.replace("{ARROW}", _ensure_arrow_png())
+# 箭头 PNG 路径延迟到首次使用时注入：QPixmap 必须等 QApplication 创建后
+# 才能构造，模块加载期求值会在程序启动时直接 abort。
+_fmt_combo_style_cache: str | None = None
+
+
+def _fmt_combo_style() -> str:
+    """返回已注入箭头 PNG 路径的 QComboBox 样式（首次调用时生成并缓存）。"""
+    global _fmt_combo_style_cache
+    if _fmt_combo_style_cache is None:
+        _fmt_combo_style_cache = FMT_COMBO_STYLE.replace(
+            "{ARROW}", _ensure_arrow_png()
+        )
+    return _fmt_combo_style_cache
 
 
 
@@ -864,7 +883,7 @@ class MistakeBookWidget(QWidget):
         # 注意 QFontComboBox 默认 editable=True，必须显式关闭）
         self.combo_font = QFontComboBox()
         self.combo_font.setEditable(False)
-        self.combo_font.setStyleSheet(FMT_COMBO_STYLE)
+        self.combo_font.setStyleSheet(_fmt_combo_style())
         self.combo_font.setFixedWidth(180)
         self.combo_font.setMaxVisibleItems(14)
         self.combo_font.setToolTip("字体（展开后输入可快速筛选）")
@@ -874,7 +893,7 @@ class MistakeBookWidget(QWidget):
         # 字号（非 editable：点击任意位置展开；光标处实际字号不在
         # 预设档位时，动态插入列表顶部显示）
         self.combo_size = QComboBox()
-        self.combo_size.setStyleSheet(FMT_COMBO_STYLE)
+        self.combo_size.setStyleSheet(_fmt_combo_style())
         self.combo_size.addItem("默认")
         self.combo_size.addItems(
             [str(s) for s in (9, 10, 10.5, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 36)]
