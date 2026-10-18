@@ -183,6 +183,8 @@ class TextParser(BaseParser):
             for drawing in page.get_drawings():
                 rect = drawing.get("rect")
                 if rect:
+                    if self._is_background_fill(drawing):
+                        continue
                     r = fitz.Rect(rect)
                     if r.width > 8 or r.height > 8:
                         drawing_rects.append(fitz.Rect(r.x0 - 1.5, r.y0 - 1.5, r.x1 + 1.5, r.y1 + 1.5))
@@ -194,6 +196,24 @@ class TextParser(BaseParser):
         if not result:
             result = self._extract_regions_by_erasing_text(page, page_rect, page_index)
         return result
+
+    @staticmethod
+    def _is_background_fill(drawing: dict) -> bool:
+        """判断绘制指令是否为"页面背景"而非题目插图。
+
+        粉笔等 App 使用 Skia/Chromium 导出 PDF，会为每块内容先画一个纯白填充
+        矩形打底。这些矩形的坐标常越出页面边界（裁剪路径的残留），裁到页内后
+        面积可能低于上限而被当成内容图，再和真正的插图合并成一张"整页截图"
+        —— 输出里于是出现原 PDF 的页眉、水印、题号一起被拍下来的画面。
+
+        纯白填充 + 无描边 = 白纸上画白色，不可能是可见内容，直接丢弃。
+        """
+        if drawing.get("color") is not None:
+            return False
+        fill = drawing.get("fill")
+        if not fill:
+            return False
+        return all(channel >= 0.98 for channel in fill)
 
     @staticmethod
     def _append_reasonable_rect(rects: list[fitz.Rect], rect: fitz.Rect,
@@ -251,6 +271,12 @@ class TextParser(BaseParser):
 
         只有"合并结果恰好就是这组堆叠位图的并集"时才拆，避免影响位图外面
         套了矢量边框等正常合并。
+
+        两张也要拆: 选项图不一定四个都挤在同一页上 —— 资料分析第 17 题的
+        A/B 排在一页、C/D 排在下一页, 每页只有两张。不拆的话两页各并成
+        一张, 全卷只解析出两张图却要配四个选项, 排版阶段判定"图数不足"后
+        会把 A/B/C/D 标签整个丢掉(见 engine 的 blank_labels), 题面只剩四个
+        光秃秃的饼图, 分不清哪个是哪个选项。
         """
         contained: list[fitz.Rect] = []
         for r in raster_rects:
@@ -263,7 +289,7 @@ class TextParser(BaseParser):
                    for u in contained):
                 continue
             contained.append(r)
-        if len(contained) < 3:
+        if len(contained) < 2:
             return None
         contained.sort(key=lambda r: r.y0)
         heights = [r.height for r in contained]
@@ -440,7 +466,9 @@ class TextParser(BaseParser):
             doc.close()
             return "text" if avg > 20 else "image"
         except Exception:
-            return "image"
+            # 无法打开时按文字型处理，交给 TextParser 抛出具体错误，
+            # 避免把损坏/加密的 PDF 误判为扫描件。
+            return "text"
 
 
 def is_likely_ad(text: str, font_size: float = 10, x_mm: float = 0, y_mm: float = 0,

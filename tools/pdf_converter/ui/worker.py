@@ -4,7 +4,10 @@ from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from tools.pdf_converter.core.pipeline import ConversionPipeline
+from tools.pdf_converter.core.pipeline import (
+    ConversionPipeline,
+    ScannedPdfError,
+)
 
 
 class ConversionWorker(QThread):
@@ -37,6 +40,9 @@ class ConversionWorker(QThread):
                 config_overrides=self.config_overrides,
             )
             self.succeeded.emit(output)
+        except ScannedPdfError as e:
+            # 扫描件不支持转换，直接给出提示，不附带堆栈
+            self.failed.emit(str(e))
         except BaseException as e:
             import traceback
             detail = traceback.format_exc()
@@ -89,6 +95,8 @@ class BatchConversionWorker(QThread):
                     config_overrides=self.config_overrides,
                 )
                 self.file_done.emit(filename, pdf_bytes)
+            except ScannedPdfError as e:
+                self.file_failed.emit(filename, str(e))
             except BaseException as e:
                 import traceback
                 detail = traceback.format_exc()

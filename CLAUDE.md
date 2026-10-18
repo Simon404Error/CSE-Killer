@@ -16,7 +16,7 @@
 |------|-----|------|
 | UI 框架 | PyQt6 ≥ 6.6 | 主窗口、工具栏、预览面板、设置面板等 |
 | PDF 解析 | PyMuPDF (fitz) ≥ 1.24 | PDF 文字提取、页面渲染、图片导出 |
-| OCR 引擎 | PaddleOCR 2.x + PaddlePaddle | 扫描版 PDF 文字识别、图片文字识别 |
+| OCR 引擎 | PaddleOCR 2.x + PaddlePaddle | 图片文字识别（OCR 识别/截图识别工具使用） |
 | PDF 生成 | ReportLab ≥ 4.2 | 转换后 PDF 排版输出 |
 | 图像处理 | Pillow ≥ 10.0 | 图片加载与预处理 |
 | 数据校验 | Pydantic ≥ 2.0 | 配置/数据模型校验 |
@@ -56,7 +56,7 @@ CivilServantsTools/
 │   │   │   ├── parser/
 │   │   │   │   ├── base.py          # BaseParser 抽象基类
 │   │   │   │   ├── text_parser.py   # TextParser：PyMuPDF 文字型 PDF 解析
-│   │   │   │   └── ocr_parser.py    # OCRParser：PaddleOCR 图片型 PDF 解析
+│   │   │   │   └── ocr_parser.py    # OCRParser：保留模块，当前转换流程不再调用
 │   │   │   ├── cleaner/
 │   │   │   │   ├── xingce_cleaner.py   # 行测清洗：去水印/广告/二维码、题号识别、选项提取、五大模块归类
 │   │   │   │   └── shenlun_cleaner.py  # 申论清洗：材料分离、作答要求提取、双栏排版识别
@@ -139,8 +139,8 @@ bytes (最终 PDF 二进制)
 
 1. **解析 (0-20%)** — 自动检测 PDF 类型：
    - 文字型 PDF → `TextParser` (PyMuPDF 文本提取)
-   - 扫描型 PDF → `OCRParser` (PaddleOCR 图像识别)
-   - OCR 首次使用会下载模型（约 100MB），需提示用户
+   - 扫描型 PDF → 抛出 `ScannedPdfError`，提示「该PDF为扫描件（图片型），暂不支持转换」
+   - 不再对扫描件执行 OCR 或保真渲染（输出与原文件一致，没有转换意义）
 
 2. **清洗 (20-30%)** — 按题型分离：
    - 行测 → `XingceCleaner`: 去水印/广告/二维码，题号+A/B/C/D选项识别，五大模块归类
@@ -149,17 +149,15 @@ bytes (最终 PDF 二进制)
 3. **排版 (30-70%)** — `LayoutEngine` 计算文本渲染位置：
    - 从 JSON 模板加载 `LayoutConfig`（页边距/字体/字号/间距/选项排列等40+参数）
    - 处理换行、分页、图片嵌入
-   - OCR 结果质量差时自动切换到「扫描件保真模式」（页面截图方式渲染）
 
 4. **生成 (70-100%)** — `PDFGenerator` (ReportLab) 输出最终 PDF
    - 可选：追加源 PDF 最后一页（保留对答案二维码）
 
 ### 容错机制
 
-- OCR 提取失败（0 题目/选项异常比例≥25%/题号标签不均衡）→ 自动回退到 `_generate_image_preserved_pdf`（将每页渲染为图片居中嵌入）
-- OCR 依赖缺失 → 弹出安装引导（调用 `setup.bat`）
-- cuDNN 运行时缺失 → 弹出 NVIDIA 下载页
-- GPU 不兼容（RTX 50 系列 Blackwell 架构）→ 自动回退 CPU
+- 扫描件/图片型 PDF → 不进入 OCR，直接抛 `ScannedPdfError`，UI 提示不支持转换
+- 未提取到任何题目 → 提示检查 PDF 是否为刷题 App 导出的文字版试卷
+- PDF 无法打开/损坏 → 按文字型交给 `TextParser`，由其抛出具体解析错误（避免误报为扫描件）
 
 ## UI 架构
 

@@ -333,6 +333,74 @@ class SettingsPanel(QWidget):
             "margin_right": self._margin_spins["spin_margin_right"].value(),
         }
 
+    def apply_config(self, config: dict):
+        """把一份已有配置回填到各控件上。
+
+        批量转换对话框用它继承主界面的排版设置 —— 否则用户在"排版设置"里
+        选好的字体、纸张、"保留尾页"等参数，在批量转换时会被一份全新的默认值
+        默默覆盖掉。
+        """
+        if not config:
+            return
+
+        def _set(spin, value):
+            old = spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(old)
+
+        def _select(combo, value):
+            if not value:
+                return
+            old = combo.blockSignals(True)
+            combo.setCurrentText(value)
+            combo.blockSignals(old)
+
+        template_index = {"xingce": 0, "shenlun": 1}.get(config.get("template"))
+        if template_index is not None:
+            old = self.combo_template.blockSignals(True)
+            self.combo_template.setCurrentIndex(template_index)
+            self.combo_template.blockSignals(old)
+
+        paper = config.get("page_size")
+        if paper in PAPER_SIZES:
+            old = self.combo_paper.blockSignals(True)
+            self.combo_paper.setCurrentText(paper)
+            self.combo_paper.blockSignals(old)
+            # 先铺该纸张的默认边距，再由配置里的显式边距覆盖（顺序不能反）
+            self._apply_paper_margins(paper)
+
+        for combo, key in ((self.combo_body_font, "body_font"),
+                           (self.combo_num_font, "num_font"),
+                           (self.combo_opt_font, "opt_font"),
+                           (self.combo_header_font, "header_font")):
+            _select(combo, config.get(key))
+
+        for spin, key in ((self.spin_body_size, "body_size"),
+                          (self.spin_opt_size, "opt_size"),
+                          (self.spin_header_size, "header_size"),
+                          (self.spin_line_spacing, "line_spacing"),
+                          (self.spin_q_spacing, "question_spacing"),
+                          (self.spin_opt_indent, "option_indent")):
+            if config.get(key) is not None:
+                _set(spin, float(config[key]))
+
+        for name, key in (("spin_margin_top", "margin_top"),
+                          ("spin_margin_bottom", "margin_bottom"),
+                          ("spin_margin_left", "margin_left"),
+                          ("spin_margin_right", "margin_right")):
+            spin = self._margin_spins.get(name)
+            if spin is not None and config.get(key) is not None:
+                _set(spin, int(round(float(config[key]))))  # 页边距是整数 QSpinBox
+
+        for chk, key, default in ((self.chk_answer_line, "show_answer_line", False),
+                                  (self.chk_page_num, "show_page_number", True),
+                                  (self.chk_keep_last_page, "keep_last_page", False)):
+            old = chk.blockSignals(True)
+            chk.setChecked(bool(config.get(key, default)))
+            chk.blockSignals(old)
+
+        self._on_config_changed()
+
     def _on_config_changed(self, *args):
         self.config_changed.emit(self.get_config())
 

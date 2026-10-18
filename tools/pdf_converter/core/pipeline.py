@@ -1,6 +1,5 @@
 """转换流水线编排器: 串联 解析→清洗→排版→生成 全流程。"""
 
-import io
 from typing import Callable
 
 from tools.pdf_converter.core.models import ParsedDocument, CleanedDocument, LaidOutDocument
@@ -11,6 +10,19 @@ from tools.pdf_converter.core.layout.engine import LayoutEngine, LayoutConfig
 from tools.pdf_converter.core.generator.font_manager import FontManager
 from tools.pdf_converter.core.generator.pdf_generator import PDFGenerator
 from tools.pdf_converter.config.settings import load_template
+
+
+SCANNED_PDF_MESSAGE = (
+    "该PDF为扫描件（图片型），暂不支持转换。\n"
+    "请使用刷题App导出的文字版PDF。"
+)
+
+
+class ScannedPdfError(ValueError):
+    """扫描件/图片型 PDF 无法转换为可重排的真题格式。"""
+
+    def __init__(self, message: str = SCANNED_PDF_MESSAGE):
+        super().__init__(message)
 
 
 class ConversionPipeline:
@@ -56,22 +68,13 @@ class ConversionPipeline:
         cleaned = self._clean(parsed, exam_type, progress)
 
         if not cleaned.questions and not cleaned.shenlun_questions and not cleaned.materials:
-            if parsed.source_type == "image":
-                if progress:
-                    progress(45, "OCR结构化失败，切换扫描件保真模式...")
-                return self._generate_image_preserved_pdf(input_path, exam_type, overrides, progress)
             raise ValueError(
                 "未能从PDF中提取到任何题目。\n"
                 "可能原因：\n"
-                "1. PDF为扫描版/图片型，OCR引擎未能识别文字\n"
-                "2. PDF内容不是公务员考试题目格式\n"
-                "请确认PDF清晰度，或检查题目格式是否正确。"
+                "1. PDF内容不是公务员考试题目格式\n"
+                "2. PDF文字层缺失或排版过于复杂\n"
+                "请检查PDF内容是否为刷题App导出的文字版试卷。"
             )
-
-        if parsed.source_type == "image" and self._ocr_structure_is_poor(parsed, cleaned):
-            if progress:
-                progress(45, "OCR结构不稳定，切换扫描件保真模式...")
-            return self._generate_image_preserved_pdf(input_path, exam_type, overrides, progress)
 
         if progress:
             progress(50, "计算排版...")
@@ -98,38 +101,11 @@ class ConversionPipeline:
 
     def _parse(self, path: str,
                progress: Callable[[int, str], None] = None) -> ParsedDocument:
-        """解析PDF文件 — 文字型走 PyMuPDF，扫描型走 PaddleOCR。"""
-        pdf_type = TextParser.detect_pdf_type(path)
-        if pdf_type == "image":
-            # 预检 OCR 环境是否可用
-            from tools.ocr_engine.paddle_recognizer import PaddleRecognizer
-            ok, reason = PaddleRecognizer.is_available()
-            if not ok:
-                raise RuntimeError(reason)
+        """解析PDF文件 — 仅支持文字型 PDF，扫描件直接拒绝。"""
+        if TextParser.detect_pdf_type(path) == "image":
+            raise ScannedPdfError()
 
-            from tools.pdf_converter.core.parser.ocr_parser import OCRParser
-
-            if OCRParser.is_first_time():
-                if progress:
-                    progress(5, "首次使用OCR，正在下载模型（约100MB）...")
-            else:
-                if progress:
-                    progress(5, "检测到扫描版PDF，加载OCR引擎...")
-
-            parser = OCRParser()
-        else:
-            parser = TextParser()
-
-        try:
-            return parser.parse(path, progress)
-        except RuntimeError as exc:
-            error_text = str(exc)
-            if "当前环境未安装 OCR 依赖" in error_text or "当前 PaddlePaddle 不是可用的 CUDA 版本" in error_text:
-                raise RuntimeError(
-                    "该PDF为扫描版/图片型，需要使用 OCR 引擎识别文字。\n"
-                    + error_text
-                ) from exc
-            raise
+        return TextParser().parse(path, progress)
 
     def _clean(self, doc: ParsedDocument, exam_type: str,
                progress: Callable[[int, str], None] = None) -> CleanedDocument:
@@ -167,53 +143,6 @@ class ConversionPipeline:
             progress(95, "输出完成")
 
         return output
-
-    @staticmethod
-    def _ocr_structure_is_poor(parsed: ParsedDocument, cleaned: CleanedDocument) -> bool:
-        """Return True when OCR text extraction is too unreliable to reflow safely."""
-        page_count = max(1, len(parsed.pages))
-
-        if cleaned.exam_type != "xingce":
-            return False
-
-        question_count = len(cleaned.questions)
-        if question_count == 0:
-            return True
-
-        # Xingce papers normally contain multiple choice questions densely
-        # across pages.  For long-format sections (言语/资料分析) each page
-        # may hold only 1–2 questions, so we require at least ¼ of the page
-        # count before trusting the OCR for reflow.
-        if page_count >= 8 and question_count < max(5, page_count // 4):
-            return True
-
-        option_counts = [len(q.options) for q in cleaned.questions]
-        abnormal_options = sum(1 for count in option_counts if count < 3 or count > 5)
-        abnormal_ratio = abnormal_options / max(1, question_count)
-        # Lowered from 0.45 — even 25% abnormal options indicates poor OCR
-        if question_count >= 8 and abnormal_ratio >= 0.25:
-            return True
-
-        # Option-label imbalance check: when OCR merges or drops option lines,
-        # A/B/C/D counts become skewed (e.g. A=121, D=105 for 99 questions).
-        # Compute the range of option-label frequencies — a spread > 15% of
-        # the expected count signals unreliable option extraction.
-        label_counts: dict[str, int] = {}
-        for q in cleaned.questions:
-            for opt in q.options:
-                label_counts[opt.label] = label_counts.get(opt.label, 0) + 1
-        if label_counts and len(label_counts) >= 2:
-            freq_values = list(label_counts.values())
-            freq_range = max(freq_values) - min(freq_values)
-            expected = question_count  # perfect: each label appears question_count times
-            if expected > 0 and freq_range / max(1, expected) >= 0.12:
-                return True
-
-        empty_ocr_pages = sum(1 for page in parsed.pages if not page.blocks)
-        if page_count >= 5 and empty_ocr_pages / page_count >= 0.2 and question_count < page_count * 1.5:
-            return True
-
-        return False
 
     @staticmethod
     def _append_last_page(input_path: str, output: bytes, exam_type: str,
@@ -278,65 +207,6 @@ class ConversionPipeline:
         out_doc.close()
         tail_doc.close()
         return result
-
-    def _generate_image_preserved_pdf(self, input_path: str, exam_type: str,
-                                      overrides: dict | None = None,
-                                      progress: Callable[[int, str], None] = None) -> bytes:
-        """Render each source page as an image and center it on the target paper."""
-        import fitz
-        from reportlab.lib.units import mm
-        from reportlab.lib.utils import ImageReader
-        from reportlab.pdfgen import canvas
-
-        template = load_template(exam_type)
-        config = LayoutConfig.from_template(template, overrides or {})
-        page_w_mm = config.page_width_mm
-        page_h_mm = config.page_height_mm
-        content_w_mm = max(20.0, page_w_mm - config.margin_left - config.margin_right)
-        content_h_mm = max(20.0, page_h_mm - config.margin_top - config.margin_bottom)
-
-        buf = io.BytesIO()
-        c = canvas.Canvas(buf, pagesize=(page_w_mm * mm, page_h_mm * mm))
-
-        with fitz.open(input_path) as src:
-            total = max(1, src.page_count)
-            for index, page in enumerate(src, start=1):
-                if progress:
-                    pct = 45 + int(index / total * 45)
-                    progress(pct, f"扫描件保真渲染... {index}/{total}")
-
-                pix = page.get_pixmap(dpi=200, alpha=False)
-                img_bytes = pix.tobytes("png")
-                src_w_mm = page.rect.width * 25.4 / 72
-                src_h_mm = page.rect.height * 25.4 / 72
-                scale = min(
-                    content_w_mm / max(src_w_mm, 1.0),
-                    content_h_mm / max(src_h_mm, 1.0),
-                )
-                draw_w_mm = src_w_mm * scale
-                draw_h_mm = src_h_mm * scale
-                x_mm = config.margin_left + (content_w_mm - draw_w_mm) / 2
-                y_top_mm = config.margin_top + (content_h_mm - draw_h_mm) / 2
-
-                reader = ImageReader(io.BytesIO(img_bytes))
-                c.drawImage(
-                    reader,
-                    x_mm * mm,
-                    (page_h_mm - y_top_mm - draw_h_mm) * mm,
-                    width=draw_w_mm * mm,
-                    height=draw_h_mm * mm,
-                    preserveAspectRatio=True,
-                    anchor="c",
-                )
-                c.showPage()
-
-        c.save()
-        output = buf.getvalue()
-
-        if progress:
-            progress(100, "完成!（扫描件保真模式）")
-
-        return output
 
     def get_available_fonts(self) -> list[str]:
         """获取可用字体列表(供UI使用)。"""

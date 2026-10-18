@@ -43,6 +43,7 @@ from tools.pdf_converter.ui.settings_panel import SettingsPanel
 from tools.pdf_converter.ui.toolbar import MainToolbar
 from tools.pdf_converter.ui.batch_dialog import BatchDialog
 from tools.pdf_converter.ui.worker import ConversionWorker
+from tools.pdf_converter.core.pipeline import SCANNED_PDF_MESSAGE
 from tools.answer_sheet.core.generator import AnswerSheetGenerator
 from tools.answer_sheet.ui.widget import AnswerSheetWidget
 from tools.exam_timer.ui.timer_widget import TimerWidget
@@ -553,7 +554,8 @@ class MainWindow(QMainWindow):
         self.mistake_book_page.status_message.connect(self._show_mistake_book_status)
 
     def _on_batch(self):
-        dialog = BatchDialog(self._fonts, self)
+        # 把主界面当前的排版设置带进批量转换，两处设置保持一致
+        dialog = BatchDialog(self._fonts, self, self.settings_panel.get_config())
         dialog.exec()
 
     def _show_answer_sheet_status(self, message: str):
@@ -674,6 +676,12 @@ class MainWindow(QMainWindow):
         # 用户主动取消 — 静默处理
         if "用户已取消转换" in error_msg:
             self.status_bar.showMessage("转换已取消")
+            return
+
+        # 扫描件不支持转换
+        if error_msg.startswith("该PDF为扫描件"):
+            QMessageBox.warning(self, "不支持转换", SCANNED_PDF_MESSAGE)
+            self.status_bar.showMessage("该PDF为扫描件，暂不支持转换")
             return
 
         # 检测是否缺少 OCR 依赖

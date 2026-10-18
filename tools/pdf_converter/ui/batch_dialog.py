@@ -99,7 +99,7 @@ class DropListWidget(QListWidget):
 class BatchDialog(QDialog):
     """批量转换对话框。"""
 
-    def __init__(self, fonts: list[str], parent=None):
+    def __init__(self, fonts: list[str], parent=None, config: dict | None = None):
         super().__init__(parent)
         self._fonts = fonts or ["SimSun"]
         self._results: dict[str, bytes] = {}   # filename → pdf_bytes
@@ -111,6 +111,9 @@ class BatchDialog(QDialog):
         self.setMinimumSize(1000, 550)
         self._setup_ui()
         self._connect_signals()
+        # 继承主界面当前的排版设置（含"保留尾页"），否则批量转换会用一份
+        # 全新的默认值把用户已经调好的参数覆盖掉。
+        self.settings_panel.apply_config(config or {})
 
     # ── UI ────────────────────────────────────────────────────
 
