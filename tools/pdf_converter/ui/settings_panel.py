@@ -40,6 +40,16 @@ PRESET_LIANKAO = {
 
 PAPER_SIZES = ["A4", "B5", "A3", "B4", "16开"]
 
+# 「行测模块删除」勾选项: (传给流水线的模块名, 界面文字)
+DROP_SECTION_ITEMS = [
+    ("政治理论", "删除 政治理论"),
+    ("常识判断", "删除 常识判断"),
+    ("言语理解与表达", "删除 言语理解与表达"),
+    ("数量关系", "删除 数量关系"),
+    ("判断推理", "删除 判断推理"),
+    ("资料分析", "删除 资料分析"),
+]
+
 # 面向行测/申论密集排版的默认边距，优先扩大正文可用宽度。
 PAPER_MARGIN_PRESETS = {
     "A3": {"top": 20, "bottom": 16, "left": 18, "right": 16},
@@ -83,6 +93,23 @@ class SettingsPanel(QWidget):
         self.combo_template.currentIndexChanged.connect(self._on_config_changed)
         t_layout.addWidget(self.combo_template)
         layout.addWidget(grp_type)
+
+        # === 行测模块删除 ===
+        grp_drop = QGroupBox("行测模块删除（不输出所选模块）")
+        dp_layout = QVBoxLayout(grp_drop)
+        dp_hint = QLabel("勾选后该模块整段（标题、题目、图表）不输出，剩余题号与模块序号自动递补。")
+        dp_hint.setWordWrap(True)
+        dp_hint.setStyleSheet("color: #6B7280; font-size: 11px;")
+        dp_layout.addWidget(dp_hint)
+        self._drop_checks: dict[str, QCheckBox] = {}
+        for key, label in DROP_SECTION_ITEMS:
+            chk = QCheckBox(label)
+            chk.setToolTip("转换时删除该模块；合并式标题（如「政治理论/常识判断」）勾选任一即整段删除")
+            chk.toggled.connect(self._on_config_changed)
+            dp_layout.addWidget(chk)
+            self._drop_checks[key] = chk
+        layout.addWidget(grp_drop)
+        self._grp_drop = grp_drop
 
         # === 快速预设 ===
         grp_preset = QGroupBox("快速预设")
@@ -307,7 +334,10 @@ class SettingsPanel(QWidget):
         self.chk_answer_line.setChecked(False)
         self.chk_page_num.setChecked(True)
         self.chk_keep_last_page.setChecked(False)
+        for chk in self._drop_checks.values():
+            chk.setChecked(False)
         self._apply_paper_margins(self.combo_paper.currentText())
+        self._update_drop_enabled()
 
     def get_config(self) -> dict:
         template_map = {0: "xingce", 1: "shenlun"}
@@ -327,6 +357,9 @@ class SettingsPanel(QWidget):
             "show_answer_line": self.chk_answer_line.isChecked(),
             "show_page_number": self.chk_page_num.isChecked(),
             "keep_last_page": self.chk_keep_last_page.isChecked(),
+            "drop_sections": [
+                key for key, chk in self._drop_checks.items() if chk.isChecked()
+            ],
             "margin_top": self._margin_spins["spin_margin_top"].value(),
             "margin_bottom": self._margin_spins["spin_margin_bottom"].value(),
             "margin_left": self._margin_spins["spin_margin_left"].value(),
@@ -399,10 +432,37 @@ class SettingsPanel(QWidget):
             chk.setChecked(bool(config.get(key, default)))
             chk.blockSignals(old)
 
+        drop_values = config.get("drop_sections")
+        if drop_values is not None:
+            selected = {str(name) for name in drop_values}
+            for key, chk in self._drop_checks.items():
+                old = chk.blockSignals(True)
+                chk.setChecked(key in selected)
+                chk.blockSignals(old)
+
         self._on_config_changed()
 
     def _on_config_changed(self, *args):
+        self._update_drop_enabled()
         self.config_changed.emit(self.get_config())
+
+    def _update_drop_enabled(self):
+        """模块删除只对行测有效: 选申论时整组隐藏并清空勾选。
+
+        隐藏而不只是置灰 —— 申论没有"模块"概念，留着控件容易被误勾选。
+        同时清空勾选: 免得从行测切到申论再切回来时，勾着的"删除"还在，
+        下一次转换莫名其妙少了一整个模块。
+        """
+        grp = getattr(self, "_grp_drop", None)
+        if grp is None:
+            return
+        is_xingce = self.combo_template.currentIndex() == 0
+        if not is_xingce:
+            for chk in self._drop_checks.values():
+                old = chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.blockSignals(old)
+        grp.setVisible(is_xingce)
 
     def _on_paper_changed(self, paper: str):
         self._apply_paper_margins(paper)
