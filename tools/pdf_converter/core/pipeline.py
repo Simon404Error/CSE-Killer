@@ -1,5 +1,6 @@
 """转换流水线编排器: 串联 解析→清洗→排版→生成 全流程。"""
 
+import re
 from typing import Callable
 
 from tools.pdf_converter.core.models import ParsedDocument, CleanedDocument, LaidOutDocument
@@ -23,6 +24,93 @@ class ScannedPdfError(ValueError):
 
     def __init__(self, message: str = SCANNED_PDF_MESSAGE):
         super().__init__(message)
+
+
+# ============================================================
+# 行测模块删除（"删除所选模块"）
+# ============================================================
+# 模块名 → 可能的写法（顺序有意义: 长名在前, 避免"言语理解"抢先匹配
+# "言语理解与表达" 后把"与表达"当成正文）
+XINGCE_MODULE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("政治理论", ("政治理论",)),
+    ("常识判断", ("常识判断",)),
+    ("言语理解与表达", ("言语理解与表达", "言语理解")),
+    ("数量关系", ("数量关系",)),
+    ("判断推理", ("判断推理",)),
+    ("资料分析", ("资料分析",)),
+)
+
+# 模块标题行的前导序号: "一." / "（二）" / "第一部分" / "模块三"
+_ORDINAL_PREFIX_RE = re.compile(
+    r"^(?:第\s*[一二三四五六七八九十百零]+\s*部分"
+    r"|模块\s*[一二三四五六七八九十百零]+"
+    r"|[（(]?[一二三四五六七八九十百零]+[)）.、．,，:：])"
+)
+
+_CN_DIGITS = "一二三四五六七八九十"
+
+
+def to_chinese_number(n: int) -> str:
+    """1 → 一, 12 → 十二, 21 → 二十一（只用于模块标题重编号）。"""
+    if n <= 0:
+        return ""
+    if n <= 10:
+        return _CN_DIGITS[n - 1]
+    if n < 20:
+        return "十" + _CN_DIGITS[n - 11]
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return _CN_DIGITS[tens - 1] + "十" + (_CN_DIGITS[ones - 1] if ones else "")
+    return str(n)
+
+
+def _starts_with_module(body: str) -> bool:
+    return any(body.startswith(alias) for _, aliases in XINGCE_MODULE_ALIASES for alias in aliases)
+
+
+def modules_in_heading(text: str) -> set[str]:
+    """从一行（或一段）标题文本里解析出模块名。
+
+    只认"标题形态"的模块名: 模块名后面必须紧跟结尾、冒号、括号、
+    "共N题"、分隔符或另一个模块名。这样材料正文里的
+    "资料分析表明…" / "数量关系是…" 不会被误判成模块标题。
+    支持合并式标题: "政治理论/常识判断"、"政治理论+常识判断"。
+    """
+    found: set[str] = set()
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        body = _ORDINAL_PREFIX_RE.sub("", line, count=1).strip()
+        # 一个标题最多连着写 3 个模块名（合并式标题）
+        for _ in range(3):
+            matched = False
+            for key, aliases in XINGCE_MODULE_ALIASES:
+                for alias in aliases:
+                    if not body.startswith(alias):
+                        continue
+                    rest = body[len(alias):]
+                    if (rest == "" or rest[0] in "：:（(【[—－-+＋/、，,　 "
+                            or rest.startswith("共") or _starts_with_module(rest)):
+                        found.add(key)
+                        body = rest.lstrip("：:（(【[—－-+＋/、，,　 ")
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched:
+                break
+    return found
+
+
+def _rewrite_ordinal(line: str, new_cn: str) -> str:
+    """把标题行的前导序号换成 new_cn（"六. 资料分析" → "三. 资料分析"）。"""
+    m = _ORDINAL_PREFIX_RE.match(line)
+    if not m:
+        return line
+    prefix = m.group(0)
+    new_prefix = re.sub(r"[一二三四五六七八九十百零]+", new_cn, prefix, count=1)
+    return new_prefix + line[m.end():]
 
 
 class ConversionPipeline:
@@ -67,6 +155,10 @@ class ConversionPipeline:
             progress(30, "清洗内容...")
         cleaned = self._clean(parsed, exam_type, progress)
 
+        # 「行测-删除所选模块」: 必须在空题目检查之前完成 —— 删完可能一题不剩
+        drop_sections = overrides.get("drop_sections") or []
+        excluded_ranges = self._filter_sections(cleaned, drop_sections, exam_type, progress)
+
         if not cleaned.questions and not cleaned.shenlun_questions and not cleaned.materials:
             raise ValueError(
                 "未能从PDF中提取到任何题目。\n"
@@ -85,6 +177,12 @@ class ConversionPipeline:
             if pg.page_number in ignored_pages:
                 continue
             all_images.extend(pg.images)
+        if excluded_ranges:
+            # 被删模块的图表/表格图不能留给上一题: 按源坐标区间剔除
+            all_images = [
+                img for img in all_images
+                if not self._image_in_ranges(img, excluded_ranges)
+            ]
         laid_out = self._layout(cleaned, exam_type, progress, overrides, all_images)
 
         if progress:
@@ -115,6 +213,140 @@ class ConversionPipeline:
         else:
             cleaner = XingceCleaner()
         return cleaner.clean(doc, progress)
+
+    def _filter_sections(self, doc: CleanedDocument, drop_sections: list[str],
+                         exam_type: str,
+                         progress: Callable[[int, str], None] = None) -> list[tuple]:
+        """删除所选行测模块，并把剩余题号/模块序号/答案区位置全部递补。
+
+        返回被删内容在源 PDF 上的坐标区间 [(起页, 起y, 止页, 止y), ...]，
+        供上层把落在区间里的图片（资料分析表格、图形推理选项图）一并剔除 ——
+        否则它们会被前一道保留的题"抢走"。
+        """
+        if exam_type != "xingce" or not drop_sections:
+            return []
+        drop = {str(name).strip() for name in drop_sections if str(name).strip()}
+        if not drop:
+            return []
+
+        questions = list(doc.questions)
+        if not questions:
+            return []
+
+        keep_flags: list[bool] = []
+        excluded: list[tuple] = []
+        current_modules: set[str] = set()
+        title_lines: list[str] = []      # 被删首题标题里不含模块名的卷面标题行
+        for idx, question in enumerate(questions):
+            heading = str(getattr(question, "section_heading", "") or "")
+            mods = modules_in_heading(heading)
+            if mods:
+                current_modules = mods
+            keep = not (current_modules & drop)
+            keep_flags.append(keep)
+            if keep:
+                continue
+            # 源区间此刻仍是"删除前"的注解, 各题区间首尾相接
+            start_page = getattr(question, "section_source_page", None) or question.source_page
+            start_y = getattr(question, "section_source_y_mm", None)
+            if start_y is None:
+                start_y = getattr(question, "source_y_mm", 0.0) or 0.0
+            excluded.append((
+                start_page, start_y,
+                getattr(question, "source_end_page", None),
+                getattr(question, "source_end_y_mm", None),
+            ))
+            # 首题标题里排在模块标题之前的行是卷面标题（如"2026年…《行测》题"），
+            # 不属于模块内容，转挂到后面第一个保留的题上，免得整卷标题凭空消失
+            if idx == 0 and heading:
+                for line in heading.splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if modules_in_heading(stripped):
+                        break
+                    title_lines.append(stripped)
+
+        if all(keep_flags):
+            doc.filtered_out.append(
+                "[section-filter] 未识别到所选模块对应的小节标题，本次未删除任何内容"
+            )
+            return []
+        if not any(keep_flags):
+            raise ValueError(
+                "删除所选模块后没有剩余题目。\n"
+                "请至少保留一个模块再转换。"
+            )
+
+        kept = [q for q, keep in zip(questions, keep_flags) if keep]
+
+        # ── 答案区位置重映射: after_count 是"第几题之后", 删题后按保留题数重算
+        remapped = [
+            (sum(1 for keep in keep_flags[:max(0, int(after_count))] if keep), lines)
+            for after_count, lines in getattr(doc, "answer_sections", []) or []
+        ]
+        doc.answer_sections = remapped
+
+        # ── 题号递补: 从 1 连续重排（行测整卷题号本来就是连续的）
+        for new_number, question in enumerate(kept, start=1):
+            question.number = new_number
+
+        # ── 模块序号递补（"五. 判断推理" → "四. 判断推理"）+ 资料分析标记重算
+        has_module_heading = any(
+            modules_in_heading(getattr(q, "section_heading", "")) for q in kept
+        )
+        ordinal = 0
+        current_modules = set()
+        for question in kept:
+            heading = str(getattr(question, "section_heading", "") or "")
+            mods = modules_in_heading(heading)
+            if mods:
+                ordinal += 1
+                current_modules = mods
+                new_cn = to_chinese_number(ordinal)
+                question.section_heading = "\n".join(
+                    _rewrite_ordinal(line, new_cn) if modules_in_heading(line) else line
+                    for line in heading.splitlines()
+                )
+            if has_module_heading:
+                # 资料分析走专门的图表排版分支; 上一个模块被删后必须按新归属重算
+                question.is_data_analysis = "资料分析" in current_modules
+
+        if title_lines and kept:
+            first = kept[0]
+            existing = str(getattr(first, "section_heading", "") or "")
+            first.section_heading = "\n".join(
+                title_lines + ([existing] if existing else [])
+            )
+
+        # ── 题目源区间重连: 图片归属按"保留后的相邻题"重新计算
+        XingceCleaner._annotate_question_ranges(kept)
+
+        doc.questions = kept
+        doc.filtered_out.append(
+            "[section-filter] 已删除模块: " + "、".join(sorted(drop))
+            + f"（剩余 {len(kept)} 题）"
+        )
+        if progress:
+            progress(45, f"已删除所选模块，剩余 {len(kept)} 题")
+        return excluded
+
+    @staticmethod
+    def _image_in_ranges(img, ranges: list[tuple]) -> bool:
+        """图片的源坐标是否落在被删除的区间里。"""
+        page = getattr(img, "page_number", 0)
+        y = img.bbox[1] if getattr(img, "bbox", None) else 0.0
+        for start_page, start_y, end_page, end_y in ranges:
+            if page < start_page:
+                continue
+            if end_page is not None and page > end_page:
+                continue
+            if page == start_page and y < (start_y or 0.0) - 2:
+                continue
+            if end_page is not None and page == end_page and end_y is not None and y >= end_y - 2:
+                continue
+            return True
+        return False
 
     def _layout(self, doc: CleanedDocument, exam_type: str,
                 progress: Callable[[int, str], None] = None,
